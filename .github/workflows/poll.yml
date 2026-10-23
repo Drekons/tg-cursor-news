@@ -1,0 +1,43 @@
+name: Poll feeds
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: poll-feeds
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore last-seen
+        uses: actions/cache/restore@v4
+        with:
+          path: last-seen.json
+          key: last-seen-${{ github.run_id }}
+          restore-keys: |
+            last-seen-
+
+      - name: Poll
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LAST_SEEN_PATH: last-seen.json
+        run: python3 poller.py
+
+      - name: Save last-seen
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: last-seen.json
+          key: last-seen-${{ github.run_id }}

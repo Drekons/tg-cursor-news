@@ -1,0 +1,7 @@
+last-seen.json
+last-seen.json.tmp
+.env
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
