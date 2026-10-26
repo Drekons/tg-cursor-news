@@ -38,6 +38,7 @@ SOURCE_STATUS = "status"
 
 STATUS_SKIP_MARKERS = ("maintenance", "scheduled")
 STATUS_INCIDENT_CATS = ("outage", "disruption", "degraded", "incident")
+STATUS_BACKFILL_THRESHOLD = 15
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,13 @@ def normalize_heading(title: str) -> str:
     title = title.replace("\\_", "_")
     title = re.sub(r"[*`]+", "", title)
     title = html.unescape(title)
+    return re.sub(r"\s+", " ", title).strip().lower()
+
+
+def normalize_status_title(title: str) -> str:
+    """One incident key: drop [component] and trailing em-dash suffix."""
+    title = re.sub(r"^\[[^\]]+\]\s*", "", title.strip())
+    title = re.sub(r"\s+[—–-]\s+.*$", "", title)
     return re.sub(r"\s+", " ", title).strip().lower()
 
 
@@ -255,7 +263,7 @@ def is_status_incident(rec: dict[str, Any]) -> bool:
 
 
 def parse_status(xml_text: str) -> list[Item]:
-    """One item per guid; skip maintenance; emit open and/or resolved keys."""
+    """Dedup guid, then normalized title. Resolved-only if already resolved."""
     by_guid: dict[str, dict[str, Any]] = {}
     for rec in rss_items(xml_text):
         guid = rec.get("guid") or ""
@@ -263,39 +271,36 @@ def parse_status(xml_text: str) -> list[Item]:
             continue
         by_guid[guid] = rec
 
-    items: list[Item] = []
+    by_stem: dict[str, Item] = {}
     for guid, rec in by_guid.items():
         if not is_status_incident(rec):
             continue
         title = rec.get("title") or guid
+        stem = normalize_status_title(title)
+        if not stem:
+            continue
         severity = _status_field(rec.get("description") or "", "Severity")
         summary = clip_summary(rec.get("description") or "")
         if severity and severity.lower() not in summary.lower():
             summary = clip_summary(f"Severity: {severity}. {summary}")
         published = parse_pubdate(rec.get("pubDate"))
         link = rec.get("link") or f"https://status.x.ai/{guid}"
-        items.append(
-            Item(
-                source=SOURCE_STATUS,
-                key=f"{guid}:open",
-                title=f"Incident: {title}",
-                summary=summary,
-                link=link,
-                published=published,
-            )
+        resolved = is_status_resolved(rec)
+        key = f"{stem}:resolved" if resolved else f"{stem}:open"
+        existing = by_stem.get(stem)
+        if existing is not None and existing.key.endswith(":resolved"):
+            continue
+        if existing is not None and not resolved:
+            continue
+        by_stem[stem] = Item(
+            source=SOURCE_STATUS,
+            key=key,
+            title=f"{'Resolved' if resolved else 'Incident'}: {title}",
+            summary=summary,
+            link=link,
+            published=published,
         )
-        if is_status_resolved(rec):
-            items.append(
-                Item(
-                    source=SOURCE_STATUS,
-                    key=f"{guid}:resolved",
-                    title=f"Resolved: {title}",
-                    summary=summary,
-                    link=link,
-                    published=published,
-                )
-            )
-    return items
+    return list(by_stem.values())
 
 
 def fetch(url: str, *, accept: str | None = None) -> str:
@@ -390,15 +395,20 @@ def mark_seen(state: dict[str, Any], source: str, keys: list[str]) -> None:
 
 def select_updates(
     state: dict[str, Any], source: str, items: list[Item]
-) -> tuple[list[Item], list[str], bool]:
-    """Return (to_send, keys_to_record, bootstrap)."""
+) -> tuple[list[Item], list[str], str | None]:
+    """Return (to_send, keys_to_record, absorb_reason).
+
+    absorb_reason is 'bootstrap', 'backfill', or None (live send).
+    """
     keys = [item.key for item in items]
     if source not in state["initialized"]:
-        return [], keys, True
+        return [], keys, "bootstrap"
     seen = source_seen(state, source)
     to_send = [item for item in items if item.key not in seen]
+    if source == SOURCE_STATUS and len(to_send) > STATUS_BACKFILL_THRESHOLD:
+        return [], keys, "backfill"
     to_send.sort(key=lambda item: item.published or datetime.max.replace(tzinfo=timezone.utc))
-    return to_send, [], False
+    return to_send, [], None
 
 
 def format_message(item: Item) -> str:
@@ -471,12 +481,12 @@ def run(state_path: Path, *, dry_run: bool) -> int:
     outgoing: list[Item] = []
 
     for source, items in fetched.items():
-        to_send, bootstrap_keys, bootstrap = select_updates(state, source, items)
-        if bootstrap:
-            mark_seen(state, source, bootstrap_keys)
+        to_send, absorb_keys, absorb = select_updates(state, source, items)
+        if absorb:
+            mark_seen(state, source, absorb_keys)
             if source not in state["initialized"]:
                 state["initialized"].append(source)
-            print(f"{source}: bootstrap {len(bootstrap_keys)} keys, send 0", file=sys.stderr)
+            print(f"{source}: {absorb} {len(absorb_keys)} keys, send 0", file=sys.stderr)
             continue
         outgoing.extend(to_send)
 
