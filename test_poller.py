@@ -132,29 +132,27 @@ class ParseAndDedupTest(unittest.TestCase):
     def test_status_dedup_by_guid_and_filters(self) -> None:
         items = poller.parse_status(STATUS_RSS)
         keys = [item.key for item in items]
-        self.assertEqual(keys.count("INC1:open"), 1)
-        self.assertNotIn("INC1:resolved", keys)
-        self.assertIn("INC2:open", keys)
-        self.assertIn("INC2:resolved", keys)
-        self.assertFalse(any(item.key.startswith("MAINT1") for item in items))
-        self.assertEqual(sum(1 for item in items if item.key.startswith("INC1")), 1)
+        self.assertEqual(keys, ["api outage:open", "old outage:resolved"])
+        self.assertFalse(any("maint" in item.key for item in items))
+        self.assertTrue(items[0].title.startswith("Incident:"))
+        self.assertTrue(items[1].title.startswith("Resolved:"))
 
     def test_first_run_sends_nothing_then_only_new_keys(self) -> None:
         state = poller.empty_state()
         changelog = poller.parse_changelog(CHANGELOG_RSS)
-        to_send, keys, bootstrap = poller.select_updates(
+        to_send, keys, mode = poller.select_updates(
             state, poller.SOURCE_CHANGELOG, changelog
         )
-        self.assertTrue(bootstrap)
+        self.assertEqual(mode, "bootstrap")
         self.assertEqual(to_send, [])
         self.assertEqual(len(keys), 2)
         poller.mark_seen(state, poller.SOURCE_CHANGELOG, keys)
         state["initialized"].append(poller.SOURCE_CHANGELOG)
 
-        to_send, keys, bootstrap = poller.select_updates(
+        to_send, keys, mode = poller.select_updates(
             state, poller.SOURCE_CHANGELOG, changelog
         )
-        self.assertFalse(bootstrap)
+        self.assertIsNone(mode)
         self.assertEqual(to_send, [])
         self.assertEqual(keys, [])
 
@@ -169,29 +167,111 @@ class ParseAndDedupTest(unittest.TestCase):
     </item></channel>""",
         )
         updated = poller.parse_changelog(extra_rss)
-        to_send, _, bootstrap = poller.select_updates(
+        to_send, _, mode = poller.select_updates(
             state, poller.SOURCE_CHANGELOG, updated
         )
-        self.assertFalse(bootstrap)
+        self.assertIsNone(mode)
         self.assertEqual([item.key for item in to_send], ["https://cursor.com/changelog/new"])
 
     def test_status_open_then_resolved_without_component_spam(self) -> None:
         state = poller.empty_state()
         first = poller.parse_status(STATUS_RSS)
-        to_send, keys, bootstrap = poller.select_updates(state, poller.SOURCE_STATUS, first)
-        self.assertTrue(bootstrap)
+        to_send, keys, mode = poller.select_updates(state, poller.SOURCE_STATUS, first)
+        self.assertEqual(mode, "bootstrap")
         self.assertEqual(to_send, [])
         poller.mark_seen(state, poller.SOURCE_STATUS, keys)
         state["initialized"].append(poller.SOURCE_STATUS)
 
         # Same investigating snapshot: nothing new, including duplicate component rows.
-        to_send, _, _ = poller.select_updates(state, poller.SOURCE_STATUS, first)
+        to_send, _, mode = poller.select_updates(state, poller.SOURCE_STATUS, first)
+        self.assertIsNone(mode)
         self.assertEqual(to_send, [])
 
         resolved = poller.parse_status(STATUS_RESOLVED_RSS)
-        to_send, _, _ = poller.select_updates(state, poller.SOURCE_STATUS, resolved)
-        self.assertEqual([item.key for item in to_send], ["INC1:resolved"])
+        to_send, _, mode = poller.select_updates(state, poller.SOURCE_STATUS, resolved)
+        self.assertIsNone(mode)
+        self.assertEqual([item.key for item in to_send], ["api outage:resolved"])
         self.assertTrue(to_send[0].title.startswith("Resolved:"))
+
+    def test_status_collapses_same_title_across_guids(self) -> None:
+        rss = """<?xml version="1.0"?>
+<rss version="2.0"><channel>
+  <item>
+    <title>[Automations] Investigating service degradation</title>
+    <guid>g1</guid>
+    <description>Status: INVESTIGATING</description>
+    <category>disruption</category>
+  </item>
+  <item>
+    <title>[Cloud Agents] Investigating service degradation</title>
+    <guid>g2</guid>
+    <description>Status: INVESTIGATING</description>
+    <category>disruption</category>
+  </item>
+  <item>
+    <title>[Grok Bot] Investigating service degradation — Grok Bot</title>
+    <guid>g3</guid>
+    <description>Status: RESOLVED</description>
+    <category>disruption</category>
+    <category>resolved</category>
+  </item>
+</channel></rss>
+"""
+        items = poller.parse_status(rss)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].key, "investigating service degradation:resolved")
+        self.assertTrue(items[0].title.startswith("Resolved:"))
+
+    def _many_status_items(self, n: int, *, resolved: bool = True) -> list[poller.Item]:
+        chunks = []
+        status = "RESOLVED" if resolved else "INVESTIGATING"
+        extra_cat = "<category>resolved</category>" if resolved else ""
+        for i in range(n):
+            chunks.append(
+                f"""<item>
+      <title>[Automations] Unique outage {i}</title>
+      <guid>G{i}</guid>
+      <description>Status: {status}</description>
+      <category>disruption</category>
+      {extra_cat}
+    </item>"""
+            )
+        rss = '<?xml version="1.0"?><rss version="2.0"><channel>' + "".join(chunks) + "</channel></rss>"
+        return poller.parse_status(rss)
+
+    def test_status_absorbs_backfill_instead_of_sending(self) -> None:
+        state = poller.empty_state()
+        seed = self._many_status_items(1)
+        to_send, keys, mode = poller.select_updates(state, poller.SOURCE_STATUS, seed)
+        self.assertEqual(mode, "bootstrap")
+        poller.mark_seen(state, poller.SOURCE_STATUS, keys)
+        state["initialized"].append(poller.SOURCE_STATUS)
+
+        flood = self._many_status_items(poller.STATUS_BACKFILL_THRESHOLD + 2)
+        self.assertGreater(len(flood), poller.STATUS_BACKFILL_THRESHOLD)
+        to_send, keys, mode = poller.select_updates(state, poller.SOURCE_STATUS, flood)
+        self.assertEqual(mode, "backfill")
+        self.assertEqual(to_send, [])
+        self.assertEqual(len(keys), len(flood))
+        poller.mark_seen(state, poller.SOURCE_STATUS, keys)
+
+        to_send, _, mode = poller.select_updates(state, poller.SOURCE_STATUS, flood)
+        self.assertIsNone(mode)
+        self.assertEqual(to_send, [])
+
+    def test_status_still_sends_small_batch(self) -> None:
+        state = poller.empty_state()
+        seed = self._many_status_items(1)
+        _, keys, _ = poller.select_updates(state, poller.SOURCE_STATUS, seed)
+        poller.mark_seen(state, poller.SOURCE_STATUS, keys)
+        state["initialized"].append(poller.SOURCE_STATUS)
+
+        two = self._many_status_items(2)
+        to_send, keys, mode = poller.select_updates(state, poller.SOURCE_STATUS, two)
+        self.assertIsNone(mode)
+        self.assertEqual(len(to_send), 1)
+        self.assertEqual(keys, [])
+        self.assertEqual(to_send[0].key, "unique outage 1:resolved")
 
     def test_state_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
